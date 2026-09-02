@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  buildModuleReplacements,
   computeBunSectionPlacement,
+  MODULE_BOUNDARY,
   replaceTailBunSection,
+  splitModulePayload,
 } from './nativeInstallation';
 
 // Real Claude Code 2.1.218 native (ELF) numbers, read via readelf:
@@ -233,5 +236,99 @@ describe('computeBunSectionPlacement', () => {
     expect(p.compact).toBe(false);
     expect(p.newVaddr % REAL_218.pageSize).toBe(0n);
     expect(p.newVaddr).toBe(0x20001000n); // align(0x20000800, page)
+  });
+});
+
+describe('buildModuleReplacements', () => {
+  // The names a code-split binary would hand to the payload.
+  const BINARY = [
+    '/$bunfs/root/cli',
+    '/$bunfs/root/chunk-a.js',
+    '/$bunfs/root/chunk-b.js',
+  ];
+  const payload = (parts: Array<[string, string]>) =>
+    parts.map(([n, b]) => `${MODULE_BOUNDARY}${n}\n${b}`).join('');
+  const split = (parts: Array<[string, string]>) =>
+    splitModulePayload(payload(parts))!;
+
+  it("accepts a payload naming exactly the binary's modules", () => {
+    const parts: Array<[string, string]> = [
+      ['/$bunfs/root/cli', 'var a=1;'],
+      ['/$bunfs/root/chunk-a.js', 'var b=2;'],
+      ['/$bunfs/root/chunk-b.js', 'var c=3;'],
+    ];
+    const out = buildModuleReplacements(split(parts), BINARY);
+    expect([...out.keys()].sort()).toEqual([...BINARY].sort());
+    expect(out.get('/$bunfs/root/chunk-a.js')?.toString('utf8')).toBe(
+      'var b=2;'
+    );
+  });
+
+  it('accepts modules in a different order than the binary lists them', () => {
+    const parts: Array<[string, string]> = [
+      ['/$bunfs/root/chunk-b.js', 'var c=3;'],
+      ['/$bunfs/root/cli', 'var a=1;'],
+      ['/$bunfs/root/chunk-a.js', 'var b=2;'],
+    ];
+    expect(() => buildModuleReplacements(split(parts), BINARY)).not.toThrow();
+  });
+
+  // A patch that clobbers a boundary line drops that module from the payload.
+  // Writing on would silently keep the module's ORIGINAL contents.
+  it("rejects a payload missing one of the binary's modules", () => {
+    const parts: Array<[string, string]> = [
+      ['/$bunfs/root/cli', 'var a=1;'],
+      ['/$bunfs/root/chunk-a.js', 'var b=2;'],
+    ];
+    expect(() => buildModuleReplacements(split(parts), BINARY)).toThrow(
+      /missing 1 module\(s\).*chunk-b\.js/s
+    );
+  });
+
+  // Map construction keeps the LAST value, so a repeated name would silently
+  // discard the edits made to the earlier copy.
+  it('rejects a payload naming the same module twice', () => {
+    const parts: Array<[string, string]> = [
+      ['/$bunfs/root/cli', 'var a=1;'],
+      ['/$bunfs/root/chunk-a.js', 'var b=2;'],
+      ['/$bunfs/root/chunk-b.js', 'var c=3;'],
+      ['/$bunfs/root/chunk-a.js', 'var b=999;'],
+    ];
+    expect(() => buildModuleReplacements(split(parts), BINARY)).toThrow(
+      /more than once.*chunk-a\.js/s
+    );
+  });
+
+  // The repack looks replacements up by name, so a name the binary does not
+  // have is never consulted and its edits vanish without a trace.
+  it('rejects a payload naming a module the binary does not have', () => {
+    const parts: Array<[string, string]> = [
+      ['/$bunfs/root/cli', 'var a=1;'],
+      ['/$bunfs/root/chunk-a.js', 'var b=2;'],
+      ['/$bunfs/root/chunk-b.js', 'var c=3;'],
+      ['/$bunfs/root/chunk-typo.js', 'var d=4;'],
+    ];
+    expect(() => buildModuleReplacements(split(parts), BINARY)).toThrow(
+      /absent from the binary.*chunk-typo\.js/s
+    );
+  });
+
+  it('reports a mangled boundary name as both unknown and missing', () => {
+    // Corrupting one name is simultaneously an unknown entry and an absent one;
+    // whichever fires, it must not be accepted.
+    const parts: Array<[string, string]> = [
+      ['/$bunfs/root/cli', 'var a=1;'],
+      ['/$bunfs/root/chunk-a.js', 'var b=2;'],
+      ['/$bunfs/root/chunk-B.js', 'var c=3;'], // was chunk-b.js
+    ];
+    expect(() => buildModuleReplacements(split(parts), BINARY)).toThrow();
+  });
+
+  it('caps the reported names so a wholesale mismatch stays readable', () => {
+    const many = Array.from(
+      { length: 30 },
+      (_, i) => `/$bunfs/root/chunk-${i}.js`
+    );
+    expect(() => buildModuleReplacements([], many)).toThrow(/\(30 total\)/);
   });
 });

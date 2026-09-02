@@ -5,6 +5,8 @@ import * as path from 'node:path';
 
 import chalk from 'chalk';
 
+import { splitModulePayload } from '../bunModulePayload';
+
 export class PatchedBundleParseError extends Error {
   constructor(message: string) {
     super(message);
@@ -116,7 +118,10 @@ const ESM_GOAL_DIAGNOSTICS = [
  * warns and skips the check, so an operational problem never blocks an
  * otherwise-valid apply.
  */
-export const assertPatchedBundleParses = (content: string): void => {
+const assertModuleParses = (
+  content: string,
+  moduleName: string | null
+): void => {
   let dir: string;
   try {
     dir = fsSync.mkdtempSync(path.join(os.tmpdir(), 'tweakcc-parse-'));
@@ -203,8 +208,9 @@ export const assertPatchedBundleParses = (content: string): void => {
       asCjs.stderr.includes(diagnostic)
     );
     const failure = goalMismatch ? asMjs : asCjs;
+    const detail = sanitizeParseError(failure.stderr, failure.tmpFile);
     throw new PatchedBundleParseError(
-      sanitizeParseError(failure.stderr, failure.tmpFile)
+      moduleName === null ? detail : `In module ${moduleName}:\n\n${detail}`
     );
   } finally {
     try {
@@ -212,5 +218,41 @@ export const assertPatchedBundleParses = (content: string): void => {
     } catch {
       // Best-effort cleanup of the temp directory.
     }
+  }
+};
+
+/**
+ * Verifies that the patched bundle still parses.
+ *
+ * A code-split binary is presented to patches as every module concatenated
+ * behind boundary markers, and that concatenation is not itself a valid
+ * program: each chunk is a separate ES module, so their top-level declarations
+ * collide and their `import`s are no longer at the start. Each module is
+ * therefore checked on its own.
+ *
+ * `originalContent`, when given, limits the check to modules the patches
+ * actually changed. An untouched module parsed before tweakcc ran and is
+ * byte-identical afterwards, so re-parsing all ~1600 of them only costs a
+ * process spawn each.
+ */
+export const assertPatchedBundleParses = (
+  content: string,
+  originalContent?: string
+): void => {
+  const parts = splitModulePayload(content);
+  if (!parts) {
+    assertModuleParses(content, null);
+    return;
+  }
+
+  const original = new Map(
+    (originalContent ? splitModulePayload(originalContent) : null) ?? []
+  );
+
+  for (const [moduleName, body] of parts) {
+    if (original.get(moduleName) === body) {
+      continue;
+    }
+    assertModuleParses(body, moduleName);
   }
 };

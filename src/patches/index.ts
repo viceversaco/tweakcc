@@ -968,6 +968,7 @@ export const applyCustomization = async (
   // ==========================================================================
   // Apply all patches
   // ==========================================================================
+  const contentBeforePatches = content;
   const { content: patchedContent, results: patchResults } =
     applyPatchImplementations(content, patchImplementations, patchFilter);
   content = patchedContent;
@@ -977,7 +978,7 @@ export const applyCustomization = async (
   // Verify the patched bundle parses before writing it
   // ==========================================================================
   try {
-    assertPatchedBundleParses(content);
+    assertPatchedBundleParses(content, contentBeforePatches);
   } catch (err) {
     if (!(err instanceof PatchedBundleParseError)) {
       throw err;

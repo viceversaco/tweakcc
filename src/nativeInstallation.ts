@@ -6,6 +6,17 @@ import fs from 'node:fs';
 import { execSync } from 'node:child_process';
 import LIEF from 'node-lief';
 import { isDebug, debug } from './utils';
+import {
+  isChunkModule,
+  MODULE_BOUNDARY,
+  splitModulePayload,
+} from './bunModulePayload';
+
+export {
+  isChunkModule,
+  MODULE_BOUNDARY,
+  splitModulePayload,
+} from './bunModulePayload';
 
 // ============================================================================
 // Nix binary wrapper detection
@@ -696,9 +707,129 @@ function getBunData(
   }
 }
 
+interface JsModule {
+  index: number;
+  name: string;
+  module: BunModule;
+  contents: Buffer;
+}
+
+/**
+ * Collects every module holding application JavaScript, in module-table order.
+ * A binary that is not code-split yields exactly one (the entrypoint); a
+ * code-split one yields the entrypoint plus its chunks.
+ *
+ * Extraction and repacking have to agree exactly on this set -- a payload is
+ * written back by module name, so both sides share this one definition rather
+ * than repeating the predicate and risking drift.
+ *
+ * Callers round-trip these contents through a UTF-8 string, so a module whose
+ * bytes do not survive that trip is dropped rather than silently mangled. On
+ * Claude Code 2.1.257 that excludes nothing (all 1622 name-selected modules
+ * round-trip exactly), but the payload does carry 118 modules that would not --
+ * native `.node` addons, zstd-compressed assets, and UTF-16 text -- and the
+ * name predicate is the part most likely to drift as Bun changes chunk naming.
+ */
+function collectJsModules(
+  bunData: Buffer,
+  bunOffsets: BunOffsets,
+  moduleStructSize: number
+): JsModule[] {
+  const jsModules: JsModule[] = [];
+
+  mapModules(
+    bunData,
+    bunOffsets,
+    moduleStructSize,
+    (module, moduleName, index) => {
+      // Module name is typically:
+      // - Unix/macOS: /$bunfs/root/claude
+      // - Windows:    B:/~BUN/root/claude.exe
+      if (!isClaudeModule(moduleName) && !isChunkModule(moduleName)) {
+        return undefined;
+      }
+
+      const contents = getStringPointerContent(bunData, module.contents);
+      if (contents.length === 0) {
+        return undefined;
+      }
+
+      if (!Buffer.from(contents.toString('utf8'), 'utf8').equals(contents)) {
+        debug(
+          `collectJsModules: Skipping ${moduleName} (index ${index}); its bytes do not survive a UTF-8 round trip (encoding=${module.encoding}, loader=${module.loader})`
+        );
+        return undefined;
+      }
+
+      jsModules.push({ index, name: moduleName, module, contents });
+      return undefined; // visit every module
+    }
+  );
+
+  return jsModules;
+}
+
+/** Caps a name list so a wholesale mismatch cannot produce an unreadable error. */
+function summarizeNames(names: string[]): string {
+  const shown = names.slice(0, 5).join(', ');
+  return names.length > 5 ? `${shown}, ... (${names.length} total)` : shown;
+}
+
+/**
+ * Turns a split payload into per-module replacements, rejecting any payload
+ * that does not name exactly the modules it was assembled from.
+ *
+ * The repack applies replacements by module name, so an unknown or repeated
+ * name is silently dropped and an absent one silently keeps the original
+ * contents. Each of those writes a binary that looks patched but is not, so
+ * validate the whole payload up front and fail loudly instead.
+ */
+export function buildModuleReplacements(
+  parts: Array<[string, string]>,
+  expectedNames: string[]
+): Map<string, Buffer> {
+  const replacements = new Map<string, Buffer>();
+  const duplicates: string[] = [];
+
+  for (const [moduleName, body] of parts) {
+    if (replacements.has(moduleName)) {
+      duplicates.push(moduleName);
+    }
+    replacements.set(moduleName, Buffer.from(body, 'utf8'));
+  }
+
+  if (duplicates.length > 0) {
+    throw new Error(
+      `Module payload names a module more than once: ${summarizeNames(duplicates)}`
+    );
+  }
+
+  const expected = new Set(expectedNames);
+  const unknown = [...replacements.keys()].filter(name => !expected.has(name));
+  if (unknown.length > 0) {
+    throw new Error(
+      `Module payload names ${unknown.length} module(s) absent from the binary: ` +
+        summarizeNames(unknown)
+    );
+  }
+
+  const missing = expectedNames.filter(name => !replacements.has(name));
+  if (missing.length > 0) {
+    throw new Error(
+      `Module payload is missing ${missing.length} module(s) present in the binary: ` +
+        summarizeNames(missing)
+    );
+  }
+
+  return replacements;
+}
+
 /**
  * Extracts claude.js from a native installation binary.
  * Returns the contents as a Buffer, or null if not found.
+ *
+ * On a code-split binary this returns every JS module concatenated behind
+ * `MODULE_BOUNDARY` markers, so that patches keep operating on one string.
  *
  * Note: If the binary might be a Nix `makeBinaryWrapper` wrapper, callers
  * should resolve it first using `resolveNixBinaryWrapper()` and pass the
@@ -717,42 +848,58 @@ export function extractClaudeJsFromNativeInstallation(
       `extractClaudeJsFromNativeInstallation: Got bunData, size=${bunData.length} bytes, moduleStructSize=${moduleStructSize}`
     );
 
-    const result = mapModules(
-      bunData,
-      bunOffsets,
-      moduleStructSize,
-      (module, moduleName, index) => {
-        debug(
-          `extractClaudeJsFromNativeInstallation: Module ${index}: ${moduleName}`
-        );
-
-        // Module name is typically:
-        // - Unix/macOS: /$bunfs/root/claude
-        // - Windows:    B:/~BUN/root/claude.exe
-        if (!isClaudeModule(moduleName)) return undefined;
-
-        const moduleContents = getStringPointerContent(
-          bunData,
-          module.contents
-        );
-
-        debug(
-          `extractClaudeJsFromNativeInstallation: Found claude module, contents length=${moduleContents.length}`
-        );
-
-        return moduleContents.length > 0 ? moduleContents : undefined;
-      }
-    );
-
-    if (result) {
-      return result;
-    }
+    const jsModules = collectJsModules(bunData, bunOffsets, moduleStructSize);
 
     debug(
-      'extractClaudeJsFromNativeInstallation: claude module not found in any module'
+      `extractClaudeJsFromNativeInstallation: Found ${jsModules.length} JS module(s)`
     );
 
-    return null;
+    if (jsModules.length === 0) {
+      debug(
+        'extractClaudeJsFromNativeInstallation: claude module not found in any module'
+      );
+      return null;
+    }
+
+    // Not code-split: hand back the entrypoint verbatim, exactly as before.
+    if (jsModules.length === 1) {
+      return jsModules[0].contents;
+    }
+
+    // The boundary must not occur inside the source it delimits, or the
+    // round-trip through the repack would mis-split. Bail out rather than
+    // risk writing a corrupted binary.
+    for (const { name, contents } of jsModules) {
+      if (contents.includes(MODULE_BOUNDARY)) {
+        throw new Error(
+          `Module ${name} already contains the tweakcc boundary marker`
+        );
+      }
+    }
+
+    // The entrypoint goes first so that the payload still begins with the
+    // program's entry module. Patches that look at the start of the bundle --
+    // the module loader lives in the first couple of KB -- keep working
+    // unchanged; in module-table order the entrypoint is somewhere in the
+    // middle (index 5 of 1802 on 2.1.257).
+    const ordered = [
+      ...jsModules.filter(({ index }) => index === bunOffsets.entryPointId),
+      ...jsModules.filter(({ index }) => index !== bunOffsets.entryPointId),
+    ];
+
+    debug(
+      `extractClaudeJsFromNativeInstallation: Code-split binary, joining ${ordered.length} modules (entry ${ordered[0]?.name} first)`
+    );
+
+    return Buffer.from(
+      ordered
+        .map(
+          ({ name, contents }) =>
+            `${MODULE_BOUNDARY}${name}\n${contents.toString('utf8')}`
+        )
+        .join(''),
+      'utf8'
+    );
   } catch (error) {
     debug(
       'extractClaudeJsFromNativeInstallation: Error during extraction:',
@@ -986,6 +1133,204 @@ function rebuildBunData(
   BUN_TRAILER.copy(newBuffer, trailerOffset);
 
   return newBuffer;
+}
+
+// Byte offsets of the StringPointer fields inside a serialized module record.
+// Both struct sizes share the first four; `moduleInfo` exists only in the new one.
+const MODULE_CONTENTS_FIELD_OFFSET = 8;
+const MODULE_BYTECODE_FIELD_OFFSET = 24;
+const MODULE_INFO_FIELD_OFFSET = 32;
+
+/** Bun's UTF-16 content encoding, whose contents are read as u16 pairs. */
+const ENCODING_UTF16 = 2;
+
+/**
+ * True when the payload holds data that `rebuildBunData()` cannot reproduce, so
+ * writing through it would corrupt the binary.
+ *
+ * `rebuildBunData()` re-serializes only the bytes some module pointer refers to.
+ * Newer Bun payloads also carry optional records -- the source-hash array, the
+ * builtin-bytecode table, the module_info string table -- which are announced by
+ * the `flags` word and referenced by no module pointer. Those are dropped while
+ * `flags` is copied verbatim, so the rebuilt payload advertises records it does
+ * not contain and Bun reads the following bytes as a record header. On Claude
+ * Code 2.1.257 that is 13,518,471 dropped bytes; on 2.1.219 it is 138, which is
+ * ordinary NUL padding.
+ *
+ * A code-split payload needs preserving for a second reason: more than one
+ * module's source has to be written back, and the serializer's per-module
+ * interleaved layout matches nothing Bun emits.
+ */
+function payloadNeedsPreservingRepack(
+  bunData: Buffer,
+  bunOffsets: BunOffsets,
+  moduleStructSize: number,
+  jsModuleCount: number
+): boolean {
+  if (jsModuleCount > 1) {
+    return true;
+  }
+
+  const stringsPerModule = moduleStructSize === SIZEOF_MODULE_NEW ? 6 : 4;
+  let referencedBytes = 0;
+  let stringCount = 0;
+
+  mapModules(bunData, bunOffsets, moduleStructSize, module => {
+    referencedBytes +=
+      module.name.length +
+      module.contents.length +
+      module.sourcemap.length +
+      module.bytecode.length +
+      module.moduleInfo.length +
+      module.bytecodeOriginPath.length;
+    stringCount += stringsPerModule;
+    return undefined;
+  });
+
+  const accounted =
+    referencedBytes +
+    bunOffsets.modulesPtr.length +
+    bunOffsets.compileExecArgvPtr.length +
+    SIZEOF_OFFSETS +
+    BUN_TRAILER.length;
+
+  // At most one NUL terminator per string is expected padding; anything beyond
+  // that (plus a page of slack) is real data the serializer would drop.
+  return bunData.length - accounted > stringCount + 4096;
+}
+
+/**
+ * Rewrites module contents without moving anything that is already in the
+ * payload.
+ *
+ * The entire data region is copied byte-for-byte and the patched source text is
+ * appended after it, so every pointer in the original payload stays valid and
+ * only the patched modules' `contents` pointers are rewritten. That matters for
+ * three reasons:
+ *
+ *  - Bun requires each bytecode blob to sit at an offset where `offset % 128 ==
+ *    120`; never moving one preserves that by construction.
+ *  - The optional-record chain and the `flags` word that describes it are never
+ *    regenerated, so they cannot disagree, and a record type this code does not
+ *    know about rides along untouched.
+ *  - Bun's bounds checks on those records are debug assertions, compiled out of
+ *    release builds, so a wrong offset is a page fault rather than an error.
+ *
+ * Each patched module also has its `bytecode` and `moduleInfo` pointers zeroed.
+ * Bun gates the whole cached-bytecode path on the bytecode pointer being
+ * present, so clearing it makes JSC compile the patched source; without it a
+ * patch that preserves the source length is silently ignored in favour of the
+ * stale bytecode. The source-hash array is deliberately left alone -- it is
+ * flag-gated, and zeroing it is unnecessary once no bytecode is presented.
+ *
+ * The cost is that the original source bytes of patched modules become dead
+ * space.
+ */
+function appendPatchedSources(
+  bunData: Buffer,
+  bunOffsets: BunOffsets,
+  moduleStructSize: number,
+  replacements: Map<string, Buffer>
+): Buffer {
+  const dataRegionLength = Number(bunOffsets.byteCount);
+  const suffixLength = SIZEOF_OFFSETS + BUN_TRAILER.length;
+
+  if (
+    !Number.isSafeInteger(dataRegionLength) ||
+    dataRegionLength < 0 ||
+    dataRegionLength + suffixLength !== bunData.length
+  ) {
+    throw new Error(
+      `Bun payload byteCount (${dataRegionLength}) does not match its length (${bunData.length}); refusing to repack`
+    );
+  }
+
+  const appended: Buffer[] = [];
+  const fixups: Array<{ record: number; offset: number; length: number }> = [];
+  let appendedLength = 0;
+
+  mapModules(bunData, bunOffsets, moduleStructSize, (module, moduleName, i) => {
+    const replacement = replacements.get(moduleName);
+    if (!replacement) {
+      return undefined;
+    }
+
+    // Only genuinely changed modules are appended; an unchanged one keeps its
+    // original bytes and costs nothing.
+    if (replacement.equals(getStringPointerContent(bunData, module.contents))) {
+      return undefined;
+    }
+
+    if (
+      module.encoding === ENCODING_UTF16 &&
+      (dataRegionLength + appendedLength) % 2 !== 0
+    ) {
+      appended.push(Buffer.alloc(1));
+      appendedLength += 1;
+    }
+
+    fixups.push({
+      record: bunOffsets.modulesPtr.offset + i * moduleStructSize,
+      offset: dataRegionLength + appendedLength,
+      length: replacement.length,
+    });
+
+    // Bun stores contents NUL-terminated.
+    appended.push(replacement, Buffer.alloc(1));
+    appendedLength += replacement.length + 1;
+
+    debug(
+      `appendPatchedSources: Module ${i} ${moduleName}: ${module.contents.length} -> ${replacement.length} bytes`
+    );
+    return undefined;
+  });
+
+  const newDataRegionLength = dataRegionLength + appendedLength;
+  if (newDataRegionLength > 0xffffffff) {
+    throw new Error(
+      'Patched Bun payload would exceed the 32-bit StringPointer range'
+    );
+  }
+
+  debug(
+    `appendPatchedSources: Rewrote ${fixups.length} module(s), payload ${bunData.length} -> ${newDataRegionLength + suffixLength} bytes`
+  );
+
+  const result = Buffer.alloc(newDataRegionLength + suffixLength);
+  bunData.copy(result, 0, 0, dataRegionLength);
+  let pos = dataRegionLength;
+  for (const part of appended) {
+    part.copy(result, pos);
+    pos += part.length;
+  }
+
+  for (const { record, offset, length } of fixups) {
+    result.writeUInt32LE(offset, record + MODULE_CONTENTS_FIELD_OFFSET);
+    result.writeUInt32LE(length, record + MODULE_CONTENTS_FIELD_OFFSET + 4);
+    result.writeUInt32LE(0, record + MODULE_BYTECODE_FIELD_OFFSET);
+    result.writeUInt32LE(0, record + MODULE_BYTECODE_FIELD_OFFSET + 4);
+    if (moduleStructSize === SIZEOF_MODULE_NEW) {
+      result.writeUInt32LE(0, record + MODULE_INFO_FIELD_OFFSET);
+      result.writeUInt32LE(0, record + MODULE_INFO_FIELD_OFFSET + 4);
+    }
+  }
+
+  // Only byteCount changes; every other field still describes the copied region.
+  let offsetsPos = newDataRegionLength;
+  result.writeBigUInt64LE(BigInt(newDataRegionLength), offsetsPos);
+  offsetsPos += 8;
+  result.writeUInt32LE(bunOffsets.modulesPtr.offset, offsetsPos);
+  result.writeUInt32LE(bunOffsets.modulesPtr.length, offsetsPos + 4);
+  offsetsPos += 8;
+  result.writeUInt32LE(bunOffsets.entryPointId, offsetsPos);
+  offsetsPos += 4;
+  result.writeUInt32LE(bunOffsets.compileExecArgvPtr.offset, offsetsPos);
+  result.writeUInt32LE(bunOffsets.compileExecArgvPtr.length, offsetsPos + 4);
+  offsetsPos += 8;
+  result.writeUInt32LE(bunOffsets.flags, offsetsPos);
+  BUN_TRAILER.copy(result, newDataRegionLength + SIZEOF_OFFSETS);
+
+  return result;
 }
 
 /**
@@ -1706,12 +2051,34 @@ export function repackNativeInstallation(
   // Extract Bun data and rebuild with modified claude.js
   const { bunOffsets, bunData, sectionHeaderSize, moduleStructSize } =
     getBunData(binary);
-  const newBuffer = rebuildBunData(
+
+  const jsModules = collectJsModules(bunData, bunOffsets, moduleStructSize);
+
+  // A payload assembled from a code-split binary carries every module it was
+  // built from; split it back apart so each lands in its own module. Only a
+  // payload naming exactly those modules may be written, since anything else
+  // would leave some module silently unpatched.
+  const parts = splitModulePayload(modifiedClaudeJs.toString('utf8'));
+  if (!parts && jsModules.length > 1) {
+    throw new Error(
+      `Binary has ${jsModules.length} JS modules but the patched payload has no module boundaries; refusing to repack`
+    );
+  }
+  const replacements = parts
+    ? buildModuleReplacements(
+        parts,
+        jsModules.map(({ name }) => name)
+      )
+    : new Map(jsModules.map(({ name }) => [name, modifiedClaudeJs]));
+
+  const newBuffer = payloadNeedsPreservingRepack(
     bunData,
     bunOffsets,
-    modifiedClaudeJs,
-    moduleStructSize
-  );
+    moduleStructSize,
+    jsModules.length
+  )
+    ? appendPatchedSources(bunData, bunOffsets, moduleStructSize, replacements)
+    : rebuildBunData(bunData, bunOffsets, modifiedClaudeJs, moduleStructSize);
 
   switch (binary.format) {
     case 'MachO':

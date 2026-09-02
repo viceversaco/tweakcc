@@ -1,4 +1,5 @@
 import { escapeIdent } from '.';
+import { entryModuleBody } from '../bunModulePayload';
 
 /**
  * Escapes every non-ASCII code unit as a `\uXXXX` sequence so injected source
@@ -47,11 +48,16 @@ export const findChalkVar = (fileContents: string): string | undefined => {
 export const getModuleLoaderFunction = (
   fileContents: string
 ): string | undefined => {
+  // The loader sits at the top of the entry module. On a code-split binary the
+  // bundle is every module concatenated, so measure from the entry module's own
+  // start rather than from the start of the payload.
+  const entry = entryModuleBody(fileContents);
+
   // Native bundles: look for ,j=(H,$,A)=>{A=H!=null? pattern (module loader)
   // This is distinct from other 3-param functions because of the H!=null check
   const nativeLoaderPattern =
     /[,;]([$\w]+)=\([$\w]+,[$\w]+,[$\w]+\)=>\{[$\w]+=[$\w]+!=null\?/;
-  const nativeMatch = fileContents.slice(0, 2000).match(nativeLoaderPattern);
+  const nativeMatch = entry.slice(0, 2000).match(nativeLoaderPattern);
   if (nativeMatch) {
     return nativeMatch[1];
   }
@@ -59,7 +65,7 @@ export const getModuleLoaderFunction = (
   // NPM bundles: var T=(H,$,A)=>{ at the start
   // In newer versions there are more than one, and the one with the shortest name
   // is the most common one and therefore the correct one.
-  const firstChunk = fileContents.slice(0, 10000);
+  const firstChunk = entry.slice(0, 10000);
   const pattern = /(?:var |,)([$\w]+)=\([$\w]+,[$\w]+,[$\w]+\)=>\{/g;
   const matches = Array.from(firstChunk.matchAll(pattern));
   if (matches.length > 0) {
